@@ -1,4 +1,3 @@
-import type * as SpeechSdkTypes from 'microsoft-cognitiveservices-speech-sdk';
 import type { SpeechTokenResponse } from '../../../shared/protocol';
 
 /**
@@ -10,10 +9,36 @@ import type { SpeechTokenResponse } from '../../../shared/protocol';
  * our backend. It is refreshed on a timer and pushed into the live recognizer
  * (`recognizer.authorizationToken = ...`), so long sessions do not fail when
  * a token expires.
+ *
+ * Lifecycle: an instance is single-use (`start()` once, `stop()` once or
+ * more). Each underlying recognizer lives in a `RecognizerSession` whose phase
+ * moves strictly forward:
+ *
+ *   live      → partial + final results and errors are handled
+ *   draining  → stopContinuousRecognitionAsync() is in progress; only FINAL
+ *               results are still delivered (Azure flushes the last phrase here)
+ *   closed    → the stop callback has fired; every callback is ignored
  */
 
-// The SDK is large, so it is loaded lazily when transcription first starts.
-type SpeechSdk = typeof SpeechSdkTypes;
+/** The subset of the Azure Speech SDK used here (lets tests supply a fake). */
+export interface RecognizerLike {
+  authorizationToken: string;
+  recognizing?: (sender: unknown, e: { result: { text: string } }) => void;
+  recognized?: (sender: unknown, e: { result: { reason: number; text: string } }) => void;
+  canceled?: (sender: unknown, e: { reason: number; errorCode: number }) => void;
+  startContinuousRecognitionAsync(cb?: () => void, err?: (e: string) => void): void;
+  stopContinuousRecognitionAsync(cb?: () => void, err?: (e: string) => void): void;
+  close(): void;
+}
+
+export interface SpeechSdkLike {
+  SpeechConfig: { fromAuthorizationToken(token: string, region: string): { speechRecognitionLanguage: string } };
+  AudioConfig: { fromStreamInput(stream: MediaStream): unknown };
+  SpeechRecognizer: new (speechConfig: never, audioConfig: never) => RecognizerLike;
+  ResultReason: { RecognizedSpeech: number };
+  CancellationReason: { Error: number };
+  CancellationErrorCode: { AuthenticationFailure: number; [code: number]: string };
+}
 
 export type RecognitionStatus = 'idle' | 'starting' | 'running' | 'error';
 
@@ -23,120 +48,162 @@ export interface SpeechTranscriberOptions {
   onPartial(text: string): void;
   onFinal(text: string): void;
   onStatus(status: RecognitionStatus, message?: string): void;
+  /** Defaults to a lazy import of the (large) Azure Speech SDK. */
+  loadSdk?: () => Promise<SpeechSdkLike>;
+  /** Defaults to `new MediaStream([track])`. */
+  createStream?: (track: MediaStreamTrack) => MediaStream;
+}
+
+interface RecognizerSession {
+  recognizer: RecognizerLike;
+  /** Private clone so the SDK may stop it on release without affecting the call. */
+  track: MediaStreamTrack;
+  phase: 'live' | 'draining' | 'closed';
+  closing: Promise<void> | null;
 }
 
 const MAX_AUTO_RETRIES = 3;
+/**
+ * Upper bound for waiting on the SDK's stop callback. Normally the callback
+ * fires as soon as Azure has flushed the final result; this only prevents a
+ * broken connection from blocking leave/restart forever.
+ */
+const STOP_CALLBACK_GUARD_MS = 5_000;
+
+const defaultLoadSdk = async (): Promise<SpeechSdkLike> =>
+  (await import('microsoft-cognitiveservices-speech-sdk')) as unknown as SpeechSdkLike;
 
 export class SpeechTranscriber {
-  private sdk: SpeechSdk | null = null;
-  private recognizer: SpeechSdkTypes.SpeechRecognizer | null = null;
-  /** Private clone so the SDK may stop it on release without affecting the call. */
-  private track: MediaStreamTrack | null = null;
+  private state: 'new' | 'active' | 'stopping' | 'stopped' = 'new';
+  private session: RecognizerSession | null = null;
+  private sdk: SpeechSdkLike | null = null;
   private refreshTimer: ReturnType<typeof setTimeout> | null = null;
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
   private retries = 0;
-  private active = false;
-  private generation = 0;
+  /** Incremented per start attempt and on stop: invalidates in-flight starts. */
+  private attempt = 0;
+  private muted: boolean;
+  private stopPromise: Promise<void> | null = null;
 
-  constructor(private readonly opts: SpeechTranscriberOptions) {}
+  constructor(private readonly opts: SpeechTranscriberOptions) {
+    this.muted = !opts.audioTrack.enabled;
+  }
 
   async start(): Promise<void> {
-    if (this.active) return;
-    this.active = true;
-    this.retries = 0;
+    if (this.state !== 'new') return;
+    this.state = 'active';
     await this.startRecognizer();
   }
 
-  /** Stops recognition; any in-flight final result is still delivered. */
-  async stop(): Promise<void> {
-    this.active = false;
-    this.generation++;
-    this.clearTimers();
-    await this.teardownRecognizer();
-    this.opts.onPartial('');
-    this.opts.onStatus('idle');
+  /**
+   * Gracefully stops recognition. Final results Azure emits while stopping
+   * are still delivered; once this resolves nothing more is emitted.
+   * Idempotent: repeated calls return the same promise.
+   */
+  stop(): Promise<void> {
+    this.stopPromise ??= this.doStop();
+    return this.stopPromise;
   }
 
   /** Mirrors the meeting mute state: muted audio is silence, so nothing is recognized. */
   setMuted(muted: boolean): void {
-    if (this.track) this.track.enabled = !muted;
+    this.muted = muted;
+    if (this.session) this.session.track.enabled = !muted;
   }
 
-  /** Manual retry after a failure. */
+  /** Manual retry after a failure. No-op once stopping. */
   async retry(): Promise<void> {
-    if (!this.active) return;
+    if (this.state !== 'active') return;
     this.retries = 0;
     this.clearTimers();
-    await this.teardownRecognizer();
-    await this.startRecognizer();
+    await this.closeSession(this.session);
+    if (this.state === 'active') await this.startRecognizer();
   }
 
   // ------------------------------------------------------------------ private
 
+  private async doStop(): Promise<void> {
+    // From here on no retry, refresh or new recognizer can start.
+    this.state = 'stopping';
+    this.attempt++;
+    this.clearTimers();
+    await this.closeSession(this.session);
+    this.state = 'stopped';
+    this.opts.onPartial('');
+    this.opts.onStatus('idle');
+  }
+
   private async startRecognizer(): Promise<void> {
-    const gen = ++this.generation;
+    const attempt = ++this.attempt;
+    const current = () => attempt === this.attempt && this.state === 'active';
     this.opts.onStatus('starting');
     try {
-      this.sdk ??= await import('microsoft-cognitiveservices-speech-sdk');
+      this.sdk ??= await (this.opts.loadSdk ?? defaultLoadSdk)();
       const sdk = this.sdk;
       const auth = await this.opts.getToken();
-      if (gen !== this.generation || !this.active) return;
+      if (!current()) return;
 
       const speechConfig = sdk.SpeechConfig.fromAuthorizationToken(auth.token, auth.region);
       speechConfig.speechRecognitionLanguage = auth.language;
-      speechConfig.outputFormat = sdk.OutputFormat.Simple;
 
-      const source = this.opts.audioTrack;
-      this.track = source.clone();
-      this.track.enabled = source.enabled;
-      const audioConfig = sdk.AudioConfig.fromStreamInput(new MediaStream([this.track]));
-      const recognizer = new sdk.SpeechRecognizer(speechConfig, audioConfig);
-      this.recognizer = recognizer;
+      const track = this.opts.audioTrack.clone();
+      track.enabled = !this.muted;
+      const stream = (this.opts.createStream ?? ((t) => new MediaStream([t])))(track);
+      const audioConfig = sdk.AudioConfig.fromStreamInput(stream);
+      const recognizer = new sdk.SpeechRecognizer(speechConfig as never, audioConfig as never);
+      const session: RecognizerSession = { recognizer, track, phase: 'live', closing: null };
+      this.session = session;
 
       recognizer.recognizing = (_s, e) => {
-        if (gen === this.generation) this.opts.onPartial(e.result.text);
+        if (session.phase === 'live') this.opts.onPartial(e.result.text);
       };
       recognizer.recognized = (_s, e) => {
-        if (e.result.reason !== sdk.ResultReason.RecognizedSpeech) return;
+        // Delivered while live AND while draining (graceful stop flush).
+        if (session.phase === 'closed' || e.result.reason !== sdk.ResultReason.RecognizedSpeech) return;
         const text = e.result.text.trim();
         this.opts.onPartial('');
         if (text) this.opts.onFinal(text);
         this.retries = 0;
       };
       recognizer.canceled = (_s, e) => {
-        if (gen !== this.generation || !this.active) return;
+        if (session.phase !== 'live' || this.session !== session || this.state !== 'active') return;
         if (e.reason === sdk.CancellationReason.Error) {
           // errorDetails may contain service internals; only the code is surfaced.
           console.warn('[speech] recognition canceled', sdk.CancellationErrorCode[e.errorCode]);
-          this.handleFailure(e.errorCode === sdk.CancellationErrorCode.AuthenticationFailure ? 'auth' : 'service');
+          this.handleFailure(session, e.errorCode === sdk.CancellationErrorCode.AuthenticationFailure ? 'auth' : 'service');
         }
       };
 
       await new Promise<void>((resolve, reject) => {
         recognizer.startContinuousRecognitionAsync(resolve, () => reject(new Error('start failed')));
       });
-      if (gen !== this.generation || !this.active) return;
+      if (!current() || this.session !== session) return;
       this.opts.onStatus('running');
       this.scheduleRefresh(auth.refreshAfterSeconds);
     } catch (err) {
-      if (gen !== this.generation || !this.active) return;
+      if (!current()) return;
       console.warn('[speech] failed to start', err instanceof Error ? err.name : err);
-      this.handleFailure('start');
+      this.handleFailure(this.session, 'start');
     }
   }
 
   private scheduleRefresh(seconds: number): void {
+    if (this.state !== 'active') return;
     if (this.refreshTimer) clearTimeout(this.refreshTimer);
     const delayMs = Math.max(30, seconds) * 1000;
-    this.refreshTimer = setTimeout(() => void this.refreshToken(), delayMs);
+    this.refreshTimer = setTimeout(() => {
+      this.refreshTimer = null;
+      void this.refreshToken();
+    }, delayMs);
   }
 
   private async refreshToken(): Promise<void> {
-    if (!this.active || !this.recognizer) return;
+    const session = this.session;
+    if (this.state !== 'active' || !session || session.phase !== 'live') return;
     try {
       const auth = await this.opts.getToken();
-      if (!this.active || !this.recognizer) return;
-      this.recognizer.authorizationToken = auth.token;
+      if (this.state !== 'active' || this.session !== session || session.phase !== 'live') return;
+      session.recognizer.authorizationToken = auth.token;
       this.scheduleRefresh(auth.refreshAfterSeconds);
     } catch {
       // Try again soon; the current token is still valid for several minutes.
@@ -144,14 +211,18 @@ export class SpeechTranscriber {
     }
   }
 
-  private handleFailure(kind: 'auth' | 'service' | 'start'): void {
-    void this.teardownRecognizer();
-    if (!this.active) return;
+  private handleFailure(session: RecognizerSession | null, kind: 'auth' | 'service' | 'start'): void {
+    void this.closeSession(session);
+    if (this.state !== 'active') return;
     if (this.retries < MAX_AUTO_RETRIES) {
       this.retries++;
       const delay = 1_000 * 2 ** (this.retries - 1);
       this.opts.onStatus('starting');
-      this.retryTimer = setTimeout(() => void this.startRecognizer(), delay);
+      if (this.retryTimer) clearTimeout(this.retryTimer);
+      this.retryTimer = setTimeout(() => {
+        this.retryTimer = null;
+        if (this.state === 'active') void this.startRecognizer();
+      }, delay);
       return;
     }
     const message =
@@ -168,24 +239,36 @@ export class SpeechTranscriber {
     this.retryTimer = null;
   }
 
-  private async teardownRecognizer(): Promise<void> {
-    const recognizer = this.recognizer;
-    const track = this.track;
-    this.recognizer = null;
-    this.track = null;
-    if (recognizer) {
+  /** Drains then closes a recognizer session. Safe to call repeatedly. */
+  private closeSession(session: RecognizerSession | null): Promise<void> {
+    if (!session) return Promise.resolve();
+    if (this.session === session) this.session = null;
+    session.closing ??= (async () => {
+      session.phase = 'draining';
       await new Promise<void>((resolve) => {
-        recognizer.stopContinuousRecognitionAsync(
-          () => resolve(),
-          () => resolve(),
-        );
+        const guard = setTimeout(resolve, STOP_CALLBACK_GUARD_MS);
+        const done = () => {
+          clearTimeout(guard);
+          resolve();
+        };
+        try {
+          session.recognizer.stopContinuousRecognitionAsync(done, done);
+        } catch {
+          done();
+        }
       });
+      session.phase = 'closed';
+      const r = session.recognizer;
+      r.recognizing = undefined;
+      r.recognized = undefined;
+      r.canceled = undefined;
       try {
-        recognizer.close();
+        r.close();
       } catch {
         // already closed
       }
-    }
-    track?.stop();
+      session.track.stop();
+    })();
+    return session.closing;
   }
 }

@@ -35,6 +35,11 @@ const envSchema = z.object({
   /** If set, time-limited TURN credentials are minted (coturn use-auth-secret) instead of static ones. */
   TURN_SHARED_SECRET: optionalString,
   TURN_CREDENTIAL_TTL_SECONDS: z.coerce.number().int().min(300).max(86_400).default(6 * 3600),
+
+  // In-memory abuse limits (container memory limit is 512 MB).
+  MAX_ROOMS: z.coerce.number().int().min(1).max(10_000).default(100),
+  MAX_TRANSCRIPT_ENTRIES: z.coerce.number().int().min(1).max(100_000).default(2_000),
+  MAX_TRANSCRIPT_CHARS_PER_SESSION: z.coerce.number().int().min(1_000).max(10_000_000).default(500_000),
 });
 
 export type AppConfig = ReturnType<typeof loadConfig>;
@@ -59,6 +64,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
       key: e.AZURE_SPEECH_KEY,
       region: e.AZURE_SPEECH_REGION,
       language: e.AZURE_SPEECH_LANGUAGE,
+    },
+    limits: {
+      maxRooms: e.MAX_ROOMS,
+      maxTranscriptEntries: e.MAX_TRANSCRIPT_ENTRIES,
+      maxTranscriptCharsPerSession: e.MAX_TRANSCRIPT_CHARS_PER_SESSION,
     },
     ice: {
       stunUrls: e.STUN_URL,

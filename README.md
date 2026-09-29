@@ -151,7 +151,10 @@ stateDiagram-v2
 - Starting a new session during the window cancels the old timer and discards the old transcript first; entries tagged with an old `sessionId` are rejected.
 - A short 5‑second grace accepts final results the recognizer flushes right after "stop".
 - When the last participant leaves, the room — including any transcript and timers — is deleted immediately.
+- Download is possible **only while the transcript is stopped and before the server-side `expiresAt`** — never while live transcription is running, even if a client emits the download event directly.
 - Downloads are generated on demand from memory (UTF‑8 with BOM, sanitised filename `transcript-<room>-<yyyy-mm-dd-hh-mm>.txt`) and never written to disk.
+- **Local privacy fallback:** every browser also schedules its own purge at `expiresAt` (converted with the server clock offset) and re-checks when a background tab becomes active again. A tab that was offline when the server deleted the transcript therefore still drops it from memory and UI. On reconnect, the server's state replaces whatever the tab held. The server timer remains authoritative.
+- **Graceful stop:** when transcription stops, each browser keeps delivering *final* results Azure flushes while `stopContinuousRecognitionAsync()` completes, so the last sentence is not lost; afterwards the recognizer's callbacks are detached.
 
 Example download:
 
@@ -189,7 +192,11 @@ See [`.env.example`](.env.example). Summary:
 | `TURN_PORT` | `3478` | coturn listening port (UDP + TCP) |
 | `TURN_MIN_PORT` / `TURN_MAX_PORT` | `49160` / `49200` | coturn UDP relay range |
 | `TURN_EXTERNAL_IP` | – | Public IP advertised by coturn (`31.40.204.61`) |
-| `TURN_LISTENING_IP` | – | Optional: bind coturn to one IP |
+| `TURN_LISTENING_IP` | – | IP coturn listens on and relays from (`31.40.204.61` in `.env.example`) |
+| `TURN_RELAY_IP` | = `TURN_LISTENING_IP` | Optional override for the relay address |
+| `MAX_ROOMS` | `100` | Max rooms in memory (created + active) |
+| `MAX_TRANSCRIPT_ENTRIES` | `2000` | Max final entries per transcript session |
+| `MAX_TRANSCRIPT_CHARS_PER_SESSION` | `500000` | Max transcript characters per session (≈1 MB) |
 
 ICE servers (including TURN credentials) are sent only to sockets that have joined a room, never through a public endpoint.
 
@@ -214,6 +221,8 @@ npm test
 npm run build
 npm run check      # all of the above
 ```
+
+`npm test` runs both suites: server (RoomManager rules with fake timers, Socket.IO integration) and client (SpeechTranscriber lifecycle with a fake Speech SDK, transcript expiry fallback, PeerManager ICE ordering with a fake `RTCPeerConnection`). No camera, microphone, Azure key or TURN server is needed. GitHub Actions (`.github/workflows/ci.yml`) runs `npm ci`, lint, typecheck, tests, build, a production `docker build` + health smoke test, and `docker compose config` with placeholder values.
 
 To run the **production image** locally (port bound to 127.0.0.1 only; no NPM/coturn required):
 
@@ -247,7 +256,10 @@ TURN relays media when two browsers cannot reach each other directly (symmetric 
 - Authentication: with `TURN_SHARED_SECRET` coturn uses `use-auth-secret` and the app hands each participant HMAC-SHA1 time-limited credentials (TURN REST API scheme). Otherwise a static `TURN_USERNAME`/`TURN_PASSWORD` pair (`lt-cred-mech`).
 - `coturn/entrypoint.sh` writes `turnserver.conf` into a tmpfs with mode 600 — credentials never appear in command-line arguments or logs.
 - Relaying to private, loopback, link-local and multicast ranges is denied (prevents using TURN to reach internal services).
-- No TLS listener (TURNS/5349) is configured; plain TURN over UDP/TCP 3478 covers the demo. Media is still encrypted end-to-end by DTLS-SRTP.
+- Listener and relay sockets are pinned to `TURN_LISTENING_IP` (or `TURN_RELAY_IP`). With host networking the host also has Docker bridge addresses; unpinned relays could be advertised with the public IP but bound to a bridge address and never receive traffic.
+- **Not implemented: TURN over TLS (TURNS, 5349).** Plain TURN over UDP/TCP 3478 covers the demo. Media is still encrypted end-to-end by DTLS‑SRTP.
+
+**Corporate network limitation:** restrictive enterprise networks often allow only HTTPS (TCP 443) and may block TURN on 3478 entirely; participants there will stay on "Connecting…". A future hardening option is TURNS on 5349 (or 443 on a dedicated IP) with a TLS certificate for `turn.melihtekin.com`. Always test a real deployment from a different network (e.g. a mobile hotspot) and confirm in `chrome://webrtc-internals` that the selected candidate pair uses a `relay` candidate when no direct path exists.
 
 ## 12. DNS configuration
 
@@ -317,6 +329,7 @@ Then configure the NPM proxy host (section 13). Update later with `git pull && d
 | Works on same network, fails across networks | Classic missing-TURN symptom — see above. Test with https://webrtc.github.io/samples/src/content/peerconnection/trickle-ice/ using a credential from the join payload. |
 | "Click to enable audio" button on a tile | Browser autoplay policy; one click resumes playback. |
 | Socket keeps "Reconnecting…" | NPM Websockets Support must be ON; `PUBLIC_BASE_URL` must exactly match the browser origin (`https://teamslistener.melihtekin.com`). |
+| Works at home, fails in an office network | The company firewall probably blocks 3478; TURNS is not implemented (see section 11). Test from a mobile hotspot to confirm. |
 | Hearing yourself | The local tile is always muted; echo is usually another participant's speakers — use headphones. |
 
 ## 16. Troubleshooting Azure Speech
@@ -335,7 +348,8 @@ Then configure the NPM proxy host (section 13). Update later with `git pull && d
 - Room IDs: 64 random bits (`crypto.randomBytes`), no listing endpoint. The creator gets a one-time host key held only in memory.
 - All Socket.IO payloads are validated with Zod (room ID, display name ≤ 40 chars with control/bidi characters stripped, SDP/ICE shape and size, transcript text ≤ 1000 chars).
 - Only joined sockets can send room events; signalling can only target participants of the sender's own room; only the host can start/stop transcripts; identity is always server-side.
-- Per-socket token-bucket rate limits per event type, per-IP limits on room creation and token requests, max 20 concurrent sockets per IP, 64 KB max message size, max 500 rooms.
+- Per-socket token-bucket rate limits per event type, per-IP limits on room creation and token requests, max 20 concurrent sockets per IP, 64 KB max message size, max 100 rooms, max 10 room creations per 5 min per IP (unjoined rooms expire after 5 min).
+- Transcript memory is bounded per session (`MAX_TRANSCRIPT_ENTRIES`, `MAX_TRANSCRIPT_CHARS_PER_SESSION`), tracked incrementally; excess entries are rejected with a `LIMIT` code and only that code is logged.
 - Production rejects Socket.IO connections from foreign origins (cross-site WebSocket hijacking).
 - Strict CSP, `frame-ancestors 'none'`, Permissions-Policy limited to camera/microphone.
 - Logs contain room IDs, participant IDs, event names and error types — never transcript text, tokens, keys or TURN passwords.
@@ -348,6 +362,8 @@ Then configure the NPM proxy host (section 13). Update later with `git pull && d
 ├── server/                 Express + Socket.IO backend
 │   ├── src/{rooms,socket,speech,http}
 │   └── test/               Vitest (unit + Socket.IO integration)
+├── client/test/            Vitest (speech lifecycle, transcript expiry, ICE ordering)
+├── .github/workflows/ci.yml
 ├── shared/protocol.ts      Typed Socket.IO protocol shared by both
 ├── coturn/entrypoint.sh    Generates coturn config from env
 ├── docs/DEPLOYMENT.md      Production runbook

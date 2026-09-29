@@ -131,6 +131,15 @@ describe('SpeechTokenService', () => {
 });
 
 describe('config', () => {
+  it('has conservative memory limit defaults and accepts overrides', () => {
+    expect(loadConfig({}).limits).toEqual({ maxRooms: 100, maxTranscriptEntries: 2000, maxTranscriptCharsPerSession: 500000 });
+    expect(loadConfig({ MAX_ROOMS: '10', MAX_TRANSCRIPT_ENTRIES: '50', MAX_TRANSCRIPT_CHARS_PER_SESSION: '20000' }).limits).toEqual({
+      maxRooms: 10,
+      maxTranscriptEntries: 50,
+      maxTranscriptCharsPerSession: 20000,
+    });
+  });
+
   it('reports invalid variables without echoing values', () => {
     expect(() => loadConfig({ PORT: 'not-a-port-secretvalue' })).toThrowError(/PORT/);
     expect(() => loadConfig({ PORT: 'not-a-port-secretvalue' })).not.toThrowError(/secretvalue/);

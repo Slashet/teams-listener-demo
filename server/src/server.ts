@@ -25,7 +25,13 @@ export interface BuildOptions {
 export function buildServer({ config, roomOptions, speech, clientDir }: BuildOptions): StartedServer {
   // The RoomManager is created before Socket.IO, so its expiry callback resolves `io` lazily.
   const ioRef: { current?: AppServer } = {};
-  const rooms = new RoomManager({ ...roomOptions, onTranscriptDeleted: transcriptDeletedNotifier(() => ioRef.current) });
+  const rooms = new RoomManager({
+    maxRooms: config.limits.maxRooms,
+    maxEntriesPerSession: config.limits.maxTranscriptEntries,
+    maxCharsPerSession: config.limits.maxTranscriptCharsPerSession,
+    ...roomOptions,
+    onTranscriptDeleted: transcriptDeletedNotifier(() => ioRef.current),
+  });
   const speechService =
     speech ?? new SpeechTokenService({ key: config.speech.key, region: config.speech.region, language: config.speech.language });
 

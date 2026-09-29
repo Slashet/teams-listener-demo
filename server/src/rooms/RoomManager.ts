@@ -43,6 +43,8 @@ interface TranscriptSession {
   status: 'idle' | 'active' | 'stopped';
   sessionId: string | null;
   entries: TranscriptEntry[];
+  /** Running total of entry text length, maintained incrementally. */
+  charCount: number;
   stoppedAt: number | null;
   expiresAt: number | null;
   deleteTimer: unknown;
@@ -75,6 +77,7 @@ export interface RoomManagerOptions {
   pendingRoomTtlMs?: number;
   maxRooms?: number;
   maxEntriesPerSession?: number;
+  maxCharsPerSession?: number;
   onTranscriptDeleted?: (roomId: string, sessionId: string | null) => void;
 }
 
@@ -102,6 +105,7 @@ export class RoomManager {
   private readonly pendingRoomTtlMs: number;
   private readonly maxRooms: number;
   private readonly maxEntriesPerSession: number;
+  private readonly maxCharsPerSession: number;
   private readonly onTranscriptDeleted: (roomId: string, sessionId: string | null) => void;
 
   constructor(opts: RoomManagerOptions = {}) {
@@ -109,9 +113,11 @@ export class RoomManager {
     this.maxParticipants = opts.maxParticipants ?? MAX_PARTICIPANTS;
     this.retentionMs = opts.transcriptRetentionMs ?? TRANSCRIPT_RETENTION_MS;
     this.lateEntryGraceMs = opts.lateEntryGraceMs ?? 5_000;
-    this.pendingRoomTtlMs = opts.pendingRoomTtlMs ?? 10 * 60_000;
-    this.maxRooms = opts.maxRooms ?? 500;
-    this.maxEntriesPerSession = opts.maxEntriesPerSession ?? 5_000;
+    this.pendingRoomTtlMs = opts.pendingRoomTtlMs ?? 5 * 60_000;
+    // Worst case memory ≈ maxRooms × maxCharsPerSession × 2 bytes (UTF-16).
+    this.maxRooms = opts.maxRooms ?? 100;
+    this.maxEntriesPerSession = opts.maxEntriesPerSession ?? 2_000;
+    this.maxCharsPerSession = opts.maxCharsPerSession ?? 500_000;
     this.onTranscriptDeleted = opts.onTranscriptDeleted ?? (() => undefined);
   }
 
@@ -311,7 +317,9 @@ export class RoomManager {
     const acceptingLate = t.status === 'stopped' && t.stoppedAt !== null && now - t.stoppedAt <= this.lateEntryGraceMs;
     if (t.status !== 'active' && !acceptingLate) return fail('NOT_ACTIVE', 'Live transcript is not active.');
     if (input.sessionId !== t.sessionId) return fail('STALE_SESSION', 'Transcript session has changed.');
-    if (t.entries.length >= this.maxEntriesPerSession) return fail('LIMIT', 'Transcript size limit reached.');
+    if (t.entries.length >= this.maxEntriesPerSession || t.charCount + input.text.length > this.maxCharsPerSession) {
+      return fail('LIMIT', 'Transcript size limit reached.');
+    }
 
     // Identity comes from the server-side session, never from the payload.
     const entry: TranscriptEntry = {
@@ -322,17 +330,26 @@ export class RoomManager {
       timestamp: now,
     };
     t.entries.push(entry);
+    t.charCount += entry.text.length;
     return { ok: true, roomId: room.roomId, entry };
   }
 
-  /** Snapshot for downloading. Only available while a transcript exists. */
-  getTranscriptForDownload(socketId: string): Result<{ roomId: string; entries: TranscriptEntry[] }, 'NOT_JOINED' | 'UNAVAILABLE'> {
+  /**
+   * Snapshot for downloading. Only available after the transcript was
+   * stopped and strictly before the server-side expiry.
+   */
+  getTranscriptForDownload(
+    socketId: string,
+  ): Result<{ roomId: string; entries: TranscriptEntry[] }, 'NOT_JOINED' | 'NOT_STOPPED' | 'UNAVAILABLE'> {
     const found = this.getBySocket(socketId);
     if (!found) return fail('NOT_JOINED', 'Join a meeting first.');
     const room = this.rooms.get(found.roomId);
     if (!room) return fail('NOT_JOINED', 'Join a meeting first.');
     const t = room.transcript;
-    if (t.status === 'idle' || t.entries.length === 0) return fail('UNAVAILABLE', 'No transcript is available.');
+    if (t.status === 'active') return fail('NOT_STOPPED', 'The transcript can be downloaded after live transcription stops.');
+    if (t.status !== 'stopped' || t.expiresAt === null || this.clock.now() >= t.expiresAt || t.entries.length === 0) {
+      return fail('UNAVAILABLE', 'No transcript is available.');
+    }
     return { ok: true, roomId: room.roomId, entries: t.entries.map((e) => ({ ...e })) };
   }
 
@@ -387,7 +404,7 @@ export class RoomManager {
 }
 
 function emptyTranscript(): TranscriptSession {
-  return { status: 'idle', sessionId: null, entries: [], stoppedAt: null, expiresAt: null, deleteTimer: null };
+  return { status: 'idle', sessionId: null, entries: [], charCount: 0, stoppedAt: null, expiresAt: null, deleteTimer: null };
 }
 
 function toInfo(p: Participant): ParticipantInfo {

@@ -22,6 +22,10 @@ umask 077
 {
   echo "listening-port=${TURN_PORT}"
   [ -n "${TURN_LISTENING_IP:-}" ] && echo "listening-ip=${TURN_LISTENING_IP}"
+  # With host networking the host also has Docker bridge addresses; pin relay
+  # sockets to the public interface so advertised relay candidates are reachable.
+  RELAY_IP="${TURN_RELAY_IP:-${TURN_LISTENING_IP:-}}"
+  [ -n "${RELAY_IP}" ] && echo "relay-ip=${RELAY_IP}"
   [ -n "${TURN_EXTERNAL_IP:-}" ] && echo "external-ip=${TURN_EXTERNAL_IP}"
   echo "realm=${TURN_REALM}"
   echo "server-name=${TURN_REALM}"
@@ -78,5 +82,6 @@ umask 077
   echo "userdb=/var/lib/coturn/turndb"
 } > "$CONF"
 
+[ -n "${RELAY_IP}" ] || echo "coturn: WARNING: TURN_LISTENING_IP/TURN_RELAY_IP not set; relay sockets may bind to Docker bridge addresses" >&2
 echo "coturn: starting on port ${TURN_PORT} (relay ${TURN_MIN_PORT}-${TURN_MAX_PORT}), realm ${TURN_REALM}"
 exec turnserver -c "$CONF"

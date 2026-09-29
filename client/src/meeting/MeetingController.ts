@@ -3,21 +3,30 @@ import {
   type JoinSuccess,
   type MediaState,
   type ParticipantInfo,
-  type TranscriptEntry,
-  type TranscriptStatus,
+  type TranscriptState,
 } from '../../../shared/protocol';
 import { fetchSpeechToken } from '../lib/api';
 import { stopStream } from '../lib/media';
 import { createMeetingSocket, type MeetingSocket } from '../lib/socket';
 import { SpeechTranscriber, type RecognitionStatus } from '../speech/SpeechTranscriber';
 import { PeerManager } from '../webrtc/PeerManager';
+import {
+  EMPTY_TRANSCRIPT,
+  TranscriptExpiryTimer,
+  transcriptDeleted,
+  transcriptEntryAdded,
+  transcriptFromServer,
+  transcriptStarted,
+  transcriptStopped,
+} from './transcriptState';
 
 /**
  * Owns the socket, the WebRTC mesh and the local speech recognizer for one
  * meeting. React subscribes to immutable snapshots of `MeetingState`.
  *
  * Transcript data lives only in this in-memory state (never in
- * localStorage/sessionStorage) and is dropped when the server deletes it.
+ * localStorage/sessionStorage) and is dropped when the server deletes it,
+ * or locally once the server-announced expiry passes (e.g. while offline).
  */
 
 export type MeetingPhase = 'connecting' | 'joined' | 'reconnecting' | 'ended' | 'error';
@@ -34,12 +43,7 @@ export interface MeetingState {
   hasVideoTrack: boolean;
   audioEnabled: boolean;
   videoEnabled: boolean;
-  transcript: {
-    status: TranscriptStatus;
-    sessionId: string | null;
-    entries: TranscriptEntry[];
-    expiresAt: number | null;
-  };
+  transcript: TranscriptState;
   /** serverTime - clientTime, used for the synchronized countdown. */
   clockOffsetMs: number;
   partialText: string;
@@ -65,6 +69,8 @@ export class MeetingController {
   private participantToken: string | null = null;
   private hostKey: string | undefined;
   private leaving = false;
+  /** Local privacy fallback; the server timer stays authoritative. */
+  private readonly expiry = new TranscriptExpiryTimer((sessionId) => this.purgeTranscript(sessionId));
 
   constructor(private readonly opts: MeetingOptions) {
     this.hostKey = opts.hostKey;
@@ -82,7 +88,7 @@ export class MeetingController {
       hasVideoTrack: Boolean(video),
       audioEnabled: Boolean(audio?.enabled),
       videoEnabled: Boolean(video?.enabled),
-      transcript: { status: 'idle', sessionId: null, entries: [], expiresAt: null },
+      transcript: EMPTY_TRANSCRIPT,
       clockOffsetMs: 0,
       partialText: '',
       recognition: { status: 'idle', message: null },
@@ -119,6 +125,7 @@ export class MeetingController {
   async leave(): Promise<void> {
     if (this.leaving) return;
     this.leaving = true;
+    this.expiry.dispose();
     await this.stopRecognition();
     this.peers?.closeAll();
     this.peers = null;
@@ -138,7 +145,7 @@ export class MeetingController {
       phase: 'ended',
       remoteStreams: {},
       participants: [],
-      transcript: { status: 'idle', sessionId: null, entries: [], expiresAt: null },
+      transcript: EMPTY_TRANSCRIPT,
       partialText: '',
     });
   }
@@ -262,8 +269,9 @@ export class MeetingController {
     });
 
     s.on('transcript:started', ({ sessionId, serverNow }) => {
+      this.expiry.cancel();
       this.set({
-        transcript: { status: 'active', sessionId, entries: [], expiresAt: null },
+        transcript: transcriptStarted(sessionId),
         clockOffsetMs: serverNow - Date.now(),
         notice: null,
       });
@@ -271,27 +279,32 @@ export class MeetingController {
     });
 
     s.on('transcript:entry', (entry) => {
-      const t = this.state.transcript;
-      if (t.status === 'idle') return;
-      this.set({ transcript: { ...t, entries: [...t.entries, entry] } });
+      const next = transcriptEntryAdded(this.state.transcript, entry);
+      if (next !== this.state.transcript) this.set({ transcript: next });
     });
 
     s.on('transcript:stopped', ({ sessionId, expiresAt, serverNow }) => {
-      const t = this.state.transcript;
-      if (t.sessionId !== sessionId) return;
-      this.set({ transcript: { ...t, status: 'stopped', expiresAt }, clockOffsetMs: serverNow - Date.now() });
+      const next = transcriptStopped(this.state.transcript, sessionId, expiresAt);
+      if (next === this.state.transcript) return;
+      const clockOffsetMs = serverNow - Date.now();
+      this.set({ transcript: next, clockOffsetMs });
+      this.expiry.schedule(sessionId, expiresAt, clockOffsetMs);
       void this.stopRecognition();
     });
 
-    s.on('transcript:deleted', ({ sessionId }) => {
-      const t = this.state.transcript;
-      if (sessionId !== null && t.sessionId !== sessionId) return;
-      const wasStopped = t.status === 'stopped';
-      this.set({
-        transcript: { status: 'idle', sessionId: null, entries: [], expiresAt: null },
-        partialText: '',
-        notice: wasStopped ? 'The transcript has been permanently deleted.' : this.state.notice,
-      });
+    s.on('transcript:deleted', ({ sessionId }) => this.purgeTranscript(sessionId));
+  }
+
+  /** Same cleanup for the server event and the local expiry fallback; idempotent. */
+  private purgeTranscript(sessionId: string | null): void {
+    const t = this.state.transcript;
+    const next = transcriptDeleted(t, sessionId);
+    if (next === t) return;
+    this.expiry.cancel();
+    this.set({
+      transcript: next,
+      partialText: '',
+      notice: t.status === 'stopped' ? 'The transcript has been permanently deleted.' : this.state.notice,
     });
   }
 
@@ -307,7 +320,8 @@ export class MeetingController {
           this.socket.removeAllListeners();
           this.socket.disconnect();
           stopStream(this.opts.localStream);
-          this.set({ phase: 'error', error: message });
+          this.expiry.dispose();
+          this.set({ phase: 'error', error: message, transcript: EMPTY_TRANSCRIPT, partialText: '' });
           return;
         }
         this.hostKey = undefined; // one-time secret
@@ -318,6 +332,10 @@ export class MeetingController {
 
   private onJoined(res: JoinSuccess): void {
     this.participantToken = res.participantToken;
+    // Server state always replaces whatever this tab still held locally.
+    const transcript = transcriptFromServer(res.transcript);
+    const clockOffsetMs = res.serverNow - Date.now();
+    this.expiry.cancel();
     this.set({
       phase: 'joined',
       error: null,
@@ -326,9 +344,13 @@ export class MeetingController {
       participants: res.participants,
       remoteStreams: {},
       connectionStates: {},
-      transcript: { ...res.transcript },
-      clockOffsetMs: res.serverNow - Date.now(),
+      transcript,
+      partialText: '',
+      clockOffsetMs,
     });
+    if (transcript.status === 'stopped' && transcript.sessionId && transcript.expiresAt !== null) {
+      this.expiry.schedule(transcript.sessionId, transcript.expiresAt, clockOffsetMs);
+    }
 
     this.peers?.closeAll();
     const peers = new PeerManager(res.iceServers, this.opts.localStream, {

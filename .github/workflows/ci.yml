@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Lint, typecheck, test, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      # Tests use fakes/mocks only: no Azure key, TURN server, camera or microphone.
+      - run: npm run test
+      - run: npm run build
+
+  docker:
+    name: Production Docker image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t teams-listener-demo:test .
+
+      - name: Smoke test container health
+        run: |
+          docker run -d --name tl-ci --read-only --tmpfs /tmp --cap-drop ALL \
+            -e NODE_ENV=production -e PUBLIC_BASE_URL=http://localhost:3000 -e TRUST_PROXY=0 \
+            -p 127.0.0.1:3000:3000 teams-listener-demo:test
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:3000/health; then echo; exit 0; fi
+            sleep 1
+          done
+          docker logs tl-ci
+          exit 1
+
+      - name: Validate production compose file (placeholder env)
+        run: |
+          cp .env.example .env
+          docker compose -f docker-compose.yml config --quiet
+          docker compose -f docker-compose.dev.yml config --quiet
+          rm .env

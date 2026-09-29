@@ -164,6 +164,8 @@ export function registerSocketHandlers({ io, rooms, ice, now = Date.now }: Socke
       }
       const result = rooms.addTranscriptEntry(socket.id, parsed.data);
       if (!result.ok) {
+        // Only the code is logged, never the text.
+        if (result.code === 'LIMIT') logger.warn('transcript entry rejected', { code: result.code });
         reply(ack, result);
         return;
       }

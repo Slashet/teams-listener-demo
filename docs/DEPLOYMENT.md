@@ -102,6 +102,17 @@ Fill in at least:
 | `AZURE_SPEECH_LANGUAGE` | `tr-TR` (default) |
 | `TURN_SHARED_SECRET` | a long random value, e.g. generated with `openssl rand -hex 32` (paste it into `.env`; do not store it anywhere else) |
 | `TURN_EXTERNAL_IP` | `31.40.204.61` |
+| `TURN_LISTENING_IP` | `31.40.204.61` (see below) |
+
+`TURN_LISTENING_IP` pins coturn's listener **and relay** sockets to one address. Check that the public IP is configured on the host interface:
+
+```bash
+ip -4 -brief addr | grep 31.40.204.61
+```
+
+If it is not listed (1:1 NAT), set `TURN_LISTENING_IP` to the private interface IP and keep `TURN_EXTERNAL_IP=31.40.204.61`. The coturn log line `Relay address to use: …` shows the result.
+
+Memory limits (`MAX_ROOMS=100`, `MAX_TRANSCRIPT_ENTRIES=2000`, `MAX_TRANSCRIPT_CHARS_PER_SESSION=500000`) can normally stay at their defaults.
 
 Leave `PUBLIC_BASE_URL=https://teamslistener.melihtekin.com`, `NODE_ENV=production`, `TRUST_PROXY=1` and the TURN URL/realm/port defaults as in the example.
 
@@ -187,7 +198,11 @@ curl -fsS https://teamslistener.melihtekin.com/health
 5. As host, **Start Live Transcript** → panel opens on the right for everyone with "Live transcript active"; speak and watch names/times appear.
 6. **Stop Live Transcript** → everyone sees the download prompt and the same 00:30 countdown; download the TXT; after 00:00 the transcript disappears everywhere.
 
-To confirm TURN relaying: in Chrome open `chrome://webrtc-internals`, select the active connection and check that the selected candidate pair uses a `relay` candidate when a direct path is not possible.
+To confirm TURN relaying: in Chrome open `chrome://webrtc-internals`, select the active connection and check that the selected candidate pair uses a `relay` candidate when a direct path is not possible. Always test from a **different network** than the server's (e.g. a phone hotspot); a test from the same LAN may connect directly and hide TURN problems.
+
+### Corporate network limitation
+
+TURN is offered only as plain TURN on **3478 UDP/TCP**. Restrictive enterprise networks frequently allow only outbound HTTPS (TCP 443) and block 3478; users there cannot connect media even though the web page loads. **TURN over TLS (TURNS, port 5349) is not implemented** in this demo. It is the recommended future hardening: a certificate for `turn.melihtekin.com`, `tls-listening-port=5349` in coturn, `turns:turn.melihtekin.com:5349?transport=tcp` added to `TURN_URL`, and 5349/tcp opened in the firewall.
 
 ## 10. Operations
 
@@ -229,4 +244,6 @@ docker compose up -d --build
 | Video only works on the same network | TURN not reachable: DNS for `turn` must be DNS only; ports 3478 udp/tcp and 49160–49200/udp open; check `docker compose logs coturn`. |
 | coturn exits immediately | Missing `TURN_REALM` or credentials; the log says which (`coturn: set TURN_SHARED_SECRET or ...`). |
 | Transcript shows "failed for your microphone" for everyone | Azure key/region wrong or quota exhausted; app logs show `speech token request failed` with only an error type. |
-| 429 responses | Rate limit hit (room creation 20/min/IP, speech token 30/min/IP). |
+| 429 responses | Rate limit hit (room creation 10 per 5 min/IP, speech token 30/min/IP). |
+| Video fails only from an office network | Firewall blocks TURN 3478; see "Corporate network limitation" above. |
+| "Server is at capacity" when creating a meeting | `MAX_ROOMS` reached (created-but-unjoined rooms expire after 5 min). |

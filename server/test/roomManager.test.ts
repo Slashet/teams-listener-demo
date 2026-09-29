@@ -279,6 +279,111 @@ describe('RoomManager', () => {
     });
   });
 
+  describe('download window', () => {
+    function started() {
+      const ctx = setup();
+      ctx.join('host', 'Host', ctx.hostKey);
+      ctx.join('guest', 'Guest');
+      const start = ctx.rooms.startTranscript('host');
+      if (!start.ok) throw new Error();
+      ctx.rooms.addTranscriptEntry('guest', { sessionId: start.sessionId, text: 'merhaba' });
+      return ctx;
+    }
+
+    it('rejects download while the transcript is active', () => {
+      const { rooms } = started();
+      expect(rooms.getTranscriptForDownload('guest')).toMatchObject({ ok: false, code: 'NOT_STOPPED' });
+      expect(rooms.getTranscriptForDownload('host')).toMatchObject({ ok: false, code: 'NOT_STOPPED' });
+    });
+
+    it('allows download after stop, inside the 30 s window', () => {
+      const { rooms } = started();
+      rooms.stopTranscript('host');
+      expect(rooms.getTranscriptForDownload('guest').ok).toBe(true);
+      vi.advanceTimersByTime(29_999);
+      expect(rooms.getTranscriptForDownload('guest').ok).toBe(true);
+    });
+
+    it('rejects download once expiresAt is reached, even if the timer has not run yet', () => {
+      // Clock without timers: expiry time passes but the deletion callback never fires.
+      let now = 1_000_000;
+      const clock = { now: () => now, setTimeout: () => ({}), clearTimeout: () => undefined };
+      const rooms = new RoomManager({ clock });
+      const r = rooms.createRoom();
+      if (!r.ok) throw new Error();
+      rooms.join({ roomId: r.roomId, socketId: 'h', displayName: 'H', hostKey: r.hostKey, media });
+      const start = rooms.startTranscript('h');
+      if (!start.ok) throw new Error();
+      rooms.addTranscriptEntry('h', { sessionId: start.sessionId, text: 'x' });
+      rooms.stopTranscript('h');
+      now += 29_999;
+      expect(rooms.getTranscriptForDownload('h').ok).toBe(true);
+      now += 1;
+      expect(rooms.getTranscriptForDownload('h')).toMatchObject({ ok: false, code: 'UNAVAILABLE' });
+    });
+
+    it('rejects download after expiry deletion', () => {
+      const { rooms } = started();
+      rooms.stopTranscript('host');
+      vi.advanceTimersByTime(30_000);
+      expect(rooms.getTranscriptForDownload('guest')).toMatchObject({ ok: false, code: 'UNAVAILABLE' });
+    });
+  });
+
+  describe('memory limits', () => {
+    it('limits the number of rooms', () => {
+      const rooms = new RoomManager({ maxRooms: 2 });
+      expect(rooms.createRoom().ok).toBe(true);
+      expect(rooms.createRoom().ok).toBe(true);
+      expect(rooms.createRoom()).toMatchObject({ ok: false, code: 'CAPACITY' });
+      rooms.dispose();
+    });
+
+    it('rejects entries beyond the per-session entry limit', () => {
+      const { rooms, join, hostKey, roomId } = setup({ maxEntriesPerSession: 3 });
+      join('h', 'H', hostKey);
+      const start = rooms.startTranscript('h');
+      if (!start.ok) throw new Error();
+      for (let i = 0; i < 3; i++) expect(rooms.addTranscriptEntry('h', { sessionId: start.sessionId, text: `t${i}` }).ok).toBe(true);
+      expect(rooms.addTranscriptEntry('h', { sessionId: start.sessionId, text: 'one more' })).toMatchObject({ ok: false, code: 'LIMIT' });
+      expect(rooms.getTranscriptState(roomId).entries).toHaveLength(3);
+    });
+
+    it('rejects entries beyond the per-session character budget and resets for a new session', () => {
+      const { rooms, join, hostKey, roomId } = setup({ maxCharsPerSession: 2_500 });
+      join('h', 'H', hostKey);
+      let start = rooms.startTranscript('h');
+      if (!start.ok) throw new Error();
+      const text = 'a'.repeat(1_000);
+      expect(rooms.addTranscriptEntry('h', { sessionId: start.sessionId, text }).ok).toBe(true);
+      expect(rooms.addTranscriptEntry('h', { sessionId: start.sessionId, text }).ok).toBe(true);
+      expect(rooms.addTranscriptEntry('h', { sessionId: start.sessionId, text })).toMatchObject({ ok: false, code: 'LIMIT' });
+      // A smaller entry that still fits is accepted.
+      expect(rooms.addTranscriptEntry('h', { sessionId: start.sessionId, text: 'b'.repeat(500) }).ok).toBe(true);
+      expect(rooms.addTranscriptEntry('h', { sessionId: start.sessionId, text: 'c' })).toMatchObject({ ok: false, code: 'LIMIT' });
+
+      // Budget resets when the transcript is deleted and a new session starts.
+      rooms.stopTranscript('h');
+      vi.advanceTimersByTime(30_000);
+      start = rooms.startTranscript('h');
+      if (!start.ok) throw new Error();
+      expect(rooms.addTranscriptEntry('h', { sessionId: start.sessionId, text }).ok).toBe(true);
+      expect(rooms.getTranscriptState(roomId).entries).toHaveLength(1);
+    });
+
+    it('resets the budget when a new session replaces one in the download window', () => {
+      const { rooms, join, hostKey } = setup({ maxCharsPerSession: 1_500 });
+      join('h', 'H', hostKey);
+      let start = rooms.startTranscript('h');
+      if (!start.ok) throw new Error();
+      rooms.addTranscriptEntry('h', { sessionId: start.sessionId, text: 'a'.repeat(1_000) });
+      rooms.stopTranscript('h');
+      start = rooms.startTranscript('h');
+      if (!start.ok) throw new Error();
+      expect(rooms.addTranscriptEntry('h', { sessionId: start.sessionId, text: 'a'.repeat(1_000) }).ok).toBe(true);
+    });
+  });
+
   describe('cleanup', () => {
     it('removes the room when the last participant leaves', () => {
       const { join, rooms, roomId, hostKey } = setup();

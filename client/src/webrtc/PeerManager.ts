@@ -27,9 +27,15 @@ interface Peer {
 }
 
 const DISCONNECT_GRACE_MS = 4_000;
+/** Max ICE candidates buffered per peer while its remote description is unknown. */
+export const MAX_PENDING_CANDIDATES = 64;
+/** Max distinct not-yet-known peers we buffer early candidates for (room max is 4). */
+const MAX_EARLY_PEERS = 8;
 
 export class PeerManager {
   private readonly peers = new Map<string, Peer>();
+  /** Candidates that arrived before the offer creating their peer (bounded). */
+  private readonly earlyCandidates = new Map<string, RTCIceCandidateInit[]>();
   private closed = false;
   /** Signals are processed strictly in arrival order. */
   private signalQueue: Promise<void> = Promise.resolve();
@@ -64,6 +70,7 @@ export class PeerManager {
   }
 
   removePeer(peerId: string): void {
+    this.earlyCandidates.delete(peerId);
     const peer = this.peers.get(peerId);
     if (!peer) return;
     this.peers.delete(peerId);
@@ -76,6 +83,7 @@ export class PeerManager {
 
   closeAll(): void {
     this.closed = true;
+    this.earlyCandidates.clear();
     for (const id of [...this.peers.keys()]) this.removePeer(id);
   }
 
@@ -83,11 +91,13 @@ export class PeerManager {
 
   private createPeer(peerId: string, isOfferer: boolean): Peer {
     const pc = new RTCPeerConnection({ iceServers: this.iceServers, bundlePolicy: 'max-bundle' });
+    const early = this.earlyCandidates.get(peerId) ?? [];
+    this.earlyCandidates.delete(peerId);
     const peer: Peer = {
       pc,
       isOfferer,
       remoteStream: new MediaStream(),
-      pendingCandidates: [],
+      pendingCandidates: early,
       localTracksAttached: false,
       restartTimer: null,
       restarting: false,
@@ -218,9 +228,19 @@ export class PeerManager {
   private async handleCandidate(from: string, candidate: RTCIceCandidateInit | null): Promise<void> {
     if (!candidate?.candidate) return;
     const peer = this.peers.get(from);
-    if (!peer) return;
+    if (!peer) {
+      // Ordering guard: keep a few candidates until the offer creates the peer.
+      let queue = this.earlyCandidates.get(from);
+      if (!queue) {
+        if (this.earlyCandidates.size >= MAX_EARLY_PEERS) return;
+        queue = [];
+        this.earlyCandidates.set(from, queue);
+      }
+      pushBounded(queue, candidate);
+      return;
+    }
     if (!peer.pc.remoteDescription) {
-      peer.pendingCandidates.push(candidate);
+      pushBounded(peer.pendingCandidates, candidate);
       return;
     }
     await peer.pc.addIceCandidate(candidate);
@@ -236,4 +256,8 @@ export class PeerManager {
       }
     }
   }
+}
+
+function pushBounded(queue: RTCIceCandidateInit[], candidate: RTCIceCandidateInit): void {
+  if (queue.length < MAX_PENDING_CANDIDATES) queue.push(candidate);
 }

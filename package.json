@@ -16,7 +16,7 @@
     "start": "npm run start -w server",
     "lint": "eslint .",
     "typecheck": "npm run typecheck -w server && npm run typecheck -w client",
-    "test": "npm run test -w server",
+    "test": "npm run test -w server && npm run test -w client",
     "check": "npm run lint && npm run typecheck && npm run test && npm run build"
   },
   "devDependencies": {

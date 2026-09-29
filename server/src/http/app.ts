@@ -73,7 +73,8 @@ export function createApp({ config, rooms, speech, clientDir }: AppDeps): expres
     next();
   });
 
-  const createRoomLimiter = rateLimit({ windowMs: 60_000, limit: 20, standardHeaders: 'draft-8', legacyHeaders: false });
+  // Unjoined rooms expire after 5 minutes, so one IP can hold at most ~10 pending rooms.
+  const createRoomLimiter = rateLimit({ windowMs: 5 * 60_000, limit: 10, standardHeaders: 'draft-8', legacyHeaders: false });
   api.post('/rooms', createRoomLimiter, (_req, res) => {
     const result = rooms.createRoom();
     if (!result.ok) {

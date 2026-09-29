@@ -276,6 +276,17 @@ describe('transcript', () => {
     expect(after).toMatchObject({ ok: false, code: 'UNAVAILABLE' });
   });
 
+  it('rejects a direct download request while the transcript is active', async () => {
+    const { sockets } = await roomWithParticipants(2);
+    const [host, guest] = sockets as [Client, Client];
+    const started = next(guest, 'transcript:started');
+    await ack(host, 'transcript:start');
+    const { sessionId } = await started;
+    await new Promise<SimpleResult>((resolve) => guest.emit('transcript:entry', { sessionId, text: 'gizli' }, resolve));
+    const res = await new Promise<DownloadResult>((resolve) => guest.emit('transcript:download', {}, resolve));
+    expect(res).toMatchObject({ ok: false, code: 'NOT_STOPPED' });
+  });
+
   it('a participant outside the room cannot download', async () => {
     await roomWithParticipants(1);
     const outsider = await connect();
