@@ -18,6 +18,10 @@ import type { SpeechTokenResponse } from '../../../shared/protocol';
  *   draining  → stopContinuousRecognitionAsync() is in progress; only FINAL
  *               results are still delivered (Azure flushes the last phrase here)
  *   closed    → the stop callback has fired; every callback is ignored
+ *
+ * At most one recognizer exists per instance: a replacement (automatic or
+ * manual retry) is only created after every previous session has fully
+ * closed, and `stop()` resolves only once all sessions are closed.
  */
 
 /** The subset of the Azure Speech SDK used here (lets tests supply a fake). */
@@ -84,6 +88,8 @@ export class SpeechTranscriber {
   private attempt = 0;
   private muted: boolean;
   private stopPromise: Promise<void> | null = null;
+  /** Sessions still draining/closing; a new recognizer waits for all of them. */
+  private readonly closings = new Set<Promise<void>>();
 
   constructor(private readonly opts: SpeechTranscriberOptions) {
     this.muted = !opts.audioTrack.enabled;
@@ -128,6 +134,7 @@ export class SpeechTranscriber {
     this.attempt++;
     this.clearTimers();
     await this.closeSession(this.session);
+    await this.allClosed(); // includes sessions closing after an earlier failure
     this.state = 'stopped';
     this.opts.onPartial('');
     this.opts.onStatus('idle');
@@ -138,6 +145,9 @@ export class SpeechTranscriber {
     const current = () => attempt === this.attempt && this.state === 'active';
     this.opts.onStatus('starting');
     try {
+      // Never overlap recognizers: wait until any previous one has fully closed.
+      await this.allClosed();
+      if (!current()) return;
       this.sdk ??= await (this.opts.loadSdk ?? defaultLoadSdk)();
       const sdk = this.sdk;
       const auth = await this.opts.getToken();
@@ -212,6 +222,8 @@ export class SpeechTranscriber {
   }
 
   private handleFailure(session: RecognizerSession | null, kind: 'auth' | 'service' | 'start'): void {
+    // Draining starts now and runs concurrently with the backoff delay; the
+    // retry's startRecognizer() waits for it before creating a new recognizer.
     void this.closeSession(session);
     if (this.state !== 'active') return;
     if (this.retries < MAX_AUTO_RETRIES) {
@@ -237,6 +249,10 @@ export class SpeechTranscriber {
     if (this.retryTimer) clearTimeout(this.retryTimer);
     this.refreshTimer = null;
     this.retryTimer = null;
+  }
+
+  private async allClosed(): Promise<void> {
+    while (this.closings.size > 0) await Promise.all([...this.closings]);
   }
 
   /** Drains then closes a recognizer session. Safe to call repeatedly. */
@@ -267,8 +283,15 @@ export class SpeechTranscriber {
       } catch {
         // already closed
       }
-      session.track.stop();
+      try {
+        session.track.stop();
+      } catch {
+        // already stopped
+      }
     })();
-    return session.closing;
+    const closing = session.closing;
+    this.closings.add(closing);
+    void closing.finally(() => this.closings.delete(closing));
+    return closing;
   }
 }

@@ -75,11 +75,14 @@ function fakeTrack(): MediaStreamTrack {
 
 function setup(opts: { tokenDelay?: Promise<void> } = {}) {
   const recognizers: FakeRecognizer[] = [];
+  /** For each created recognizer: were all previously created ones already closed? */
+  const priorClosedAtCreation: boolean[] = [];
   let tokenCount = 0;
   const sdk: SpeechSdkLike = {
     SpeechConfig: { fromAuthorizationToken: (token) => ({ speechRecognitionLanguage: '', token }) },
     AudioConfig: { fromStreamInput: () => ({}) },
     SpeechRecognizer: function (speechConfig: { token: string }) {
+      priorClosedAtCreation.push(recognizers.every((prev) => prev.closed));
       const r = new FakeRecognizer(speechConfig.token);
       recognizers.push(r);
       return r;
@@ -107,7 +110,7 @@ function setup(opts: { tokenDelay?: Promise<void> } = {}) {
     createStream: () => ({}) as MediaStream,
   });
   const clones = (track as unknown as { clones: { stopped: boolean; enabled: boolean }[] }).clones;
-  return { transcriber, recognizers, getToken, finals, partials, statuses, clones };
+  return { transcriber, recognizers, priorClosedAtCreation, getToken, finals, partials, statuses, clones };
 }
 
 describe('SpeechTranscriber', () => {
@@ -238,6 +241,96 @@ describe('SpeechTranscriber', () => {
     await vi.advanceTimersByTimeAsync(60_000);
     expect(recognizers).toHaveLength(1);
     expect(getToken).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not create the replacement recognizer until the failed one has finished closing', async () => {
+    const { transcriber, recognizers, priorClosedAtCreation, finals } = setup();
+    await transcriber.start();
+    const first = recognizers[0]!;
+    // Azure takes longer to acknowledge stop (3 s) than the first retry backoff (1 s).
+    first.autoCompleteStop = false;
+    first.emitError();
+    expect(first.stopCalls).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(1_000); // backoff elapsed
+    expect(recognizers).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1_900);
+    expect(recognizers).toHaveLength(1);
+
+    // A final phrase flushed while draining is still delivered.
+    first.emitFinal('drained phrase');
+    expect(finals).toEqual(['drained phrase']);
+
+    first.completeStop();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(first.closed).toBe(true);
+    expect(recognizers).toHaveLength(2);
+    expect(priorClosedAtCreation).toEqual([true, true]);
+    await transcriber.stop();
+  });
+
+  it('manual retry also waits for the previous recognizer to close', async () => {
+    const { transcriber, recognizers, priorClosedAtCreation } = setup();
+    await transcriber.start();
+    recognizers[0]!.autoCompleteStop = false;
+    const retrying = transcriber.retry();
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(recognizers).toHaveLength(1);
+    recognizers[0]!.completeStop();
+    await retrying;
+    expect(recognizers).toHaveLength(2);
+    expect(priorClosedAtCreation).toEqual([true, true]);
+    await transcriber.stop();
+  });
+
+  it('stop() while a retry waits for the old recognizer to close prevents any new recognizer', async () => {
+    const { transcriber, recognizers, getToken, statuses } = setup();
+    await transcriber.start();
+    const first = recognizers[0]!;
+    first.autoCompleteStop = false;
+    first.emitError();
+    await vi.advanceTimersByTimeAsync(1_500); // retry fired and is waiting on the drain
+
+    let stopped = false;
+    const stopping = transcriber.stop().then(() => (stopped = true));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(stopped).toBe(false); // stop waits for the draining recognizer too
+
+    first.completeStop();
+    await stopping;
+    expect(first.closed).toBe(true);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(recognizers).toHaveLength(1);
+    expect(getToken).toHaveBeenCalledTimes(1);
+    expect(statuses.at(-1)).toBe('idle');
+    expect(transcriber.stop()).toBe(transcriber.stop()); // idempotent: same promise
+  });
+
+  it('stop() during the retry backoff also waits for the draining recognizer', async () => {
+    const { transcriber, recognizers } = setup();
+    await transcriber.start();
+    const first = recognizers[0]!;
+    first.autoCompleteStop = false;
+    first.emitError(); // backoff 1 s pending, drain pending
+    const stopping = transcriber.stop();
+    first.completeStop();
+    await stopping;
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(recognizers).toHaveLength(1);
+    expect(first.closed).toBe(true);
+  });
+
+  it('falls back to the stop guard if Azure never acknowledges stop, then retries', async () => {
+    const { transcriber, recognizers, priorClosedAtCreation } = setup();
+    await transcriber.start();
+    recognizers[0]!.autoCompleteStop = false;
+    recognizers[0]!.emitError();
+    await vi.advanceTimersByTimeAsync(4_999);
+    expect(recognizers).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(recognizers).toHaveLength(2);
+    expect(priorClosedAtCreation).toEqual([true, true]);
+    await transcriber.stop();
   });
 
   it('manual retry is a no-op after stop', async () => {

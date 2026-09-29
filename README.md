@@ -222,7 +222,9 @@ npm run build
 npm run check      # all of the above
 ```
 
-`npm test` runs both suites: server (RoomManager rules with fake timers, Socket.IO integration) and client (SpeechTranscriber lifecycle with a fake Speech SDK, transcript expiry fallback, PeerManager ICE ordering with a fake `RTCPeerConnection`). No camera, microphone, Azure key or TURN server is needed. GitHub Actions (`.github/workflows/ci.yml`) runs `npm ci`, lint, typecheck, tests, build, a production `docker build` + health smoke test, and `docker compose config` with placeholder values.
+`npm test` runs both suites: server (RoomManager rules with fake timers, Socket.IO integration) and client (SpeechTranscriber lifecycle with a fake Speech SDK, transcript expiry fallback, PeerManager ICE ordering with a fake `RTCPeerConnection`). No camera, microphone, Azure key or TURN server is needed. GitHub Actions (`.github/workflows/ci.yml`) runs `npm ci`, lint, typecheck, tests, build, a production `docker build` + health smoke test, `docker compose config` with placeholder values, and a coturn runtime smoke test (`scripts/ci-coturn-smoke.sh`: starts the production compose `coturn` service on 127.0.0.1 with placeholder values and checks UDP/TCP TURN allocations). The script can also be run locally from the repository root (it refuses to run if a `.env` already exists).
+
+The primary branch is `main`.
 
 To run the **production image** locally (port bound to 127.0.0.1 only; no NPM/coturn required):
 
@@ -307,7 +309,7 @@ NPM resolves `teams-listener-app` because both containers are on `web_network`. 
 Full step-by-step guide: [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
 ```bash
-git clone https://github.com/slashet/teams-listener-demo.git
+git clone --branch main https://github.com/slashet/teams-listener-demo.git
 cd teams-listener-demo
 cp .env.example .env
 chmod 600 .env

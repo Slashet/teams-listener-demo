@@ -80,7 +80,7 @@ The external network must exist before `docker compose up`, otherwise Compose fa
 
 ```bash
 cd /opt            # or any directory you use for stacks
-sudo git clone https://github.com/slashet/teams-listener-demo.git
+sudo git clone --branch main https://github.com/slashet/teams-listener-demo.git
 sudo chown -R "$USER": teams-listener-demo
 cd teams-listener-demo
 ```

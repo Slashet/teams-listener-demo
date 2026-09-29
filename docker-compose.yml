@@ -52,7 +52,8 @@ services:
       - ./coturn/entrypoint.sh:/etc/coturn/entrypoint.sh:ro
     tmpfs:
       - /tmp:size=8m
-      - /var/lib/coturn:size=8m
+      # coturn runs as nobody (65534); its runtime DB dir must be writable by it.
+      - /var/lib/coturn:size=8m,uid=65534,gid=65534,mode=0700
     # Only TURN-related variables are passed to coturn.
     environment:
       TURN_REALM: ${TURN_REALM:?set TURN_REALM in .env}

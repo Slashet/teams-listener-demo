@@ -59,3 +59,16 @@ jobs:
           docker compose -f docker-compose.yml config --quiet
           docker compose -f docker-compose.dev.yml config --quiet
           rm .env
+
+  coturn:
+    name: coturn smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # Starts the production compose `coturn` service (same image + entrypoint)
+      # with placeholder values bound to 127.0.0.1, then checks UDP/TCP TURN
+      # allocations, relay pinning, a clean log and rejection of a wrong secret.
+      - name: Start coturn and verify
+        run: ./scripts/ci-coturn-smoke.sh
