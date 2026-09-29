@@ -10,6 +10,7 @@ import { stopStream } from '../lib/media';
 import { createMeetingSocket, type MeetingSocket } from '../lib/socket';
 import { SpeechTranscriber, type RecognitionStatus } from '../speech/SpeechTranscriber';
 import { PeerManager } from '../webrtc/PeerManager';
+import { RecognitionCoordinator } from './RecognitionCoordinator';
 import {
   EMPTY_TRANSCRIPT,
   TranscriptExpiryTimer,
@@ -65,7 +66,8 @@ export class MeetingController {
   private readonly listeners = new Set<Listener>();
   private readonly socket: MeetingSocket;
   private peers: PeerManager | null = null;
-  private transcriber: SpeechTranscriber | null = null;
+  /** Serializes speech recognizer start/stop so instances never overlap. */
+  private readonly recognition: RecognitionCoordinator;
   private participantToken: string | null = null;
   private hostKey: string | undefined;
   private leaving = false;
@@ -94,6 +96,27 @@ export class MeetingController {
       recognition: { status: 'idle', message: null },
       notice: null,
     };
+    this.recognition = new RecognitionCoordinator({
+      createTranscriber: (callbacks) => {
+        const track = this.opts.localStream.getAudioTracks()[0];
+        if (!track) return null;
+        return new SpeechTranscriber({
+          audioTrack: track,
+          getToken: () => {
+            if (!this.participantToken) return Promise.reject(new Error('not joined'));
+            return fetchSpeechToken(this.participantToken);
+          },
+          ...callbacks,
+        });
+      },
+      sink: {
+        setRecognition: (status, message) => this.set({ recognition: { status, message } }),
+        setPartial: (text) => this.set({ partialText: text }),
+        sendFinal: (sessionId, text) => this.sendFinal(sessionId, text),
+      },
+      unavailableMessage: 'No microphone available, so your speech cannot be transcribed.',
+    });
+    this.recognition.setMuted(!audio?.enabled);
     this.socket = createMeetingSocket();
     this.bindSocket();
   }
@@ -126,7 +149,8 @@ export class MeetingController {
     if (this.leaving) return;
     this.leaving = true;
     this.expiry.dispose();
-    await this.stopRecognition();
+    // Waits until any active or draining recognizer has fully cleaned up.
+    await this.recognition.dispose();
     this.peers?.closeAll();
     this.peers = null;
     if (this.socket.connected) {
@@ -154,7 +178,7 @@ export class MeetingController {
     const track = this.opts.localStream.getAudioTracks()[0];
     if (!track) return;
     track.enabled = !track.enabled;
-    this.transcriber?.setMuted(!track.enabled);
+    this.recognition.setMuted(!track.enabled);
     this.set({ audioEnabled: track.enabled });
     this.publishMedia();
   }
@@ -205,7 +229,7 @@ export class MeetingController {
   }
 
   retryRecognition(): void {
-    void this.transcriber?.retry();
+    this.recognition.retry();
   }
 
   dismissNotice(): void {
@@ -235,7 +259,7 @@ export class MeetingController {
     s.on('disconnect', () => {
       if (this.leaving) return;
       // The server drops us on disconnect; tear down and rejoin on reconnect.
-      void this.stopRecognition();
+      void this.recognition.stop();
       this.peers?.closeAll();
       this.peers = null;
       this.set({ phase: 'reconnecting', remoteStreams: {}, connectionStates: {}, partialText: '' });
@@ -275,7 +299,7 @@ export class MeetingController {
         clockOffsetMs: serverNow - Date.now(),
         notice: null,
       });
-      void this.startRecognition(sessionId);
+      void this.recognition.start(sessionId);
     });
 
     s.on('transcript:entry', (entry) => {
@@ -289,7 +313,7 @@ export class MeetingController {
       const clockOffsetMs = serverNow - Date.now();
       this.set({ transcript: next, clockOffsetMs });
       this.expiry.schedule(sessionId, expiresAt, clockOffsetMs);
-      void this.stopRecognition();
+      void this.recognition.stop();
     });
 
     s.on('transcript:deleted', ({ sessionId }) => this.purgeTranscript(sessionId));
@@ -319,6 +343,7 @@ export class MeetingController {
             !firstJoin && res.code === 'ROOM_NOT_FOUND' ? 'The connection was lost and the meeting has ended.' : res.message;
           this.socket.removeAllListeners();
           this.socket.disconnect();
+          void this.recognition.dispose();
           stopStream(this.opts.localStream);
           this.expiry.dispose();
           this.set({ phase: 'error', error: message, transcript: EMPTY_TRANSCRIPT, partialText: '' });
@@ -363,36 +388,9 @@ export class MeetingController {
       if (p.participantId !== res.selfId) void peers.connectTo(p.participantId);
     }
 
-    if (res.transcript.status === 'active' && res.transcript.sessionId) void this.startRecognition(res.transcript.sessionId);
-  }
-
-  private async startRecognition(sessionId: string): Promise<void> {
-    await this.stopRecognition();
-    const track = this.opts.localStream.getAudioTracks()[0];
-    if (!track) {
-      this.set({ recognition: { status: 'error', message: 'No microphone available, so your speech cannot be transcribed.' } });
-      return;
-    }
-    const transcriber = new SpeechTranscriber({
-      audioTrack: track,
-      getToken: () => {
-        if (!this.participantToken) return Promise.reject(new Error('not joined'));
-        return fetchSpeechToken(this.participantToken);
-      },
-      onPartial: (text) => this.set({ partialText: text }),
-      onFinal: (text) => this.sendFinal(sessionId, text),
-      onStatus: (status, message) => this.set({ recognition: { status, message: message ?? null } }),
-    });
-    this.transcriber = transcriber;
-    transcriber.setMuted(!track.enabled);
-    await transcriber.start();
-  }
-
-  private async stopRecognition(): Promise<void> {
-    const t = this.transcriber;
-    this.transcriber = null;
-    if (t) await t.stop();
-    this.set({ partialText: '', recognition: { status: 'idle', message: null } });
+    // Queued behind any recognizer still draining from before the reconnect.
+    if (res.transcript.status === 'active' && res.transcript.sessionId) void this.recognition.start(res.transcript.sessionId);
+    else void this.recognition.stop();
   }
 
   private sendFinal(sessionId: string, text: string): void {
