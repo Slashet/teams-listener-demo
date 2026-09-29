@@ -1,0 +1,79 @@
+# Production deployment for teamslistener.melihtekin.com
+#
+#   cp .env.example .env   # fill in secrets
+#   docker compose up -d --build
+#
+# The app is reachable ONLY through Nginx Proxy Manager on the external
+# `web_network` (teams-listener-app:3000). Port 3000 is not published.
+# coturn uses host networking so TURN traffic bypasses NPM entirely.
+
+name: teams-listener
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: teams-listener-demo:latest
+    container_name: teams-listener-app
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+    expose:
+      - "3000"
+    networks:
+      - web_network
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  coturn:
+    image: coturn/coturn:4.6.3
+    container_name: teams-listener-coturn
+    restart: unless-stopped
+    # Host networking: TURN needs the real public IP and a UDP relay port
+    # range; Docker port publishing of ranges is slow and error-prone.
+    network_mode: host
+    entrypoint: ["/bin/sh", "/etc/coturn/entrypoint.sh"]
+    volumes:
+      - ./coturn/entrypoint.sh:/etc/coturn/entrypoint.sh:ro
+    tmpfs:
+      - /tmp:size=8m
+      - /var/lib/coturn:size=8m
+    # Only TURN-related variables are passed to coturn.
+    environment:
+      TURN_REALM: ${TURN_REALM:?set TURN_REALM in .env}
+      TURN_PORT: ${TURN_PORT:-3478}
+      TURN_MIN_PORT: ${TURN_MIN_PORT:-49160}
+      TURN_MAX_PORT: ${TURN_MAX_PORT:-49200}
+      TURN_EXTERNAL_IP: ${TURN_EXTERNAL_IP:-}
+      TURN_LISTENING_IP: ${TURN_LISTENING_IP:-}
+      TURN_USERNAME: ${TURN_USERNAME:-}
+      TURN_PASSWORD: ${TURN_PASSWORD:-}
+      TURN_SHARED_SECRET: ${TURN_SHARED_SECRET:-}
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  web_network:
+    external: true

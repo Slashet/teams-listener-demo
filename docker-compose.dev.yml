@@ -1,0 +1,27 @@
+# Local test of the production image (standalone file, NOT an override):
+#
+#   docker compose -f docker-compose.dev.yml up --build
+#   open http://localhost:3000
+#
+# Publishes port 3000 on 127.0.0.1 only and does not need web_network or
+# coturn. Never use this file in production.
+
+name: teams-listener-dev
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: teams-listener-demo:dev
+    container_name: teams-listener-app-dev
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      PUBLIC_BASE_URL: http://localhost:3000
+      TRUST_PROXY: "0"
+    ports:
+      - "127.0.0.1:3000:3000"
